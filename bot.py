@@ -1,139 +1,60 @@
 import os
-import sqlite3
-import asyncio
-from datetime import datetime, timedelta, time
+import psycopg2
+from datetime import datetime
 import pytz
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # =========================
 # НАСТРОЙКИ
 # =========================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # токен берём из Railway / .env
-ADMIN_ID = 2021080653               # твой Telegram ID
-TZ = pytz.timezone("Asia/Yekaterinburg") # часовой пояс
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID"))
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-DB_NAME = "bot.db"
+TZ = pytz.timezone("Asia/Yekaterinburg")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
-scheduler = AsyncIOScheduler(timezone=TZ)
 
 # =========================
 # БАЗА ДАННЫХ
 # =========================
 
 def get_db():
-    return sqlite3.connect(DB_NAME)
+    return psycopg2.connect(DATABASE_URL)
 
 def init_db():
     conn = get_db()
     cur = conn.cursor()
 
-    # пользователи
     cur.execute("""
     CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        telegram_id INTEGER UNIQUE,
+        id SERIAL PRIMARY KEY,
+        telegram_id BIGINT UNIQUE,
         name TEXT
     )
     """)
 
-    # шаблоны расписания (еженедельные)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS schedule_templates (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        title TEXT,
-        weekday INTEGER,      -- 0 = понедельник
-        time TEXT,            -- HH:MM
-        capacity INTEGER,
-        active INTEGER
-    )
-    """)
-
-    # конкретные тренировки
     cur.execute("""
     CREATE TABLE IF NOT EXISTS trainings (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        template_id INTEGER,
-        start_time TEXT,
+        id SERIAL PRIMARY KEY,
+        title TEXT,
+        start_time TIMESTAMP,
         capacity INTEGER
     )
     """)
 
-    # записи пользователей
     cur.execute("""
     CREATE TABLE IF NOT EXISTS bookings (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        training_id INTEGER,
-        created_at TEXT
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        training_id INTEGER REFERENCES trainings(id) ON DELETE CASCADE,
+        created_at TIMESTAMP
     )
     """)
-
-    conn.commit()
-    conn.close()
-
-# =========================
-# НАЧАЛЬНОЕ РАСПИСАНИЕ
-# =========================
-
-def seed_templates():
-    conn = get_db()
-    cur = conn.cursor()
-
-    cur.execute("SELECT COUNT(*) FROM schedule_templates")
-    if cur.fetchone()[0] == 0:
-        templates = [
-            ("Джампинг", 0, "10:00", 14, 1),
-            ("Джампинг", 0, "19:30", 14, 1),
-            ("Жиротопка", 2, "19:30", None, 1),
-        ]
-        cur.executemany(
-            "INSERT INTO schedule_templates (title, weekday, time, capacity, active) VALUES (?, ?, ?, ?, ?)",
-            templates
-        )
-
-    conn.commit()
-    conn.close()
-
-# =========================
-# ГЕНЕРАЦИЯ ТРЕНИРОВОК
-# =========================
-
-def generate_trainings(days_ahead=14):
-    conn = get_db()
-    cur = conn.cursor()
-
-    now = datetime.now(TZ)
-
-    cur.execute("SELECT id, title, weekday, time, capacity FROM schedule_templates WHERE active = 1")
-    templates = cur.fetchall()
-
-    for tpl_id, title, weekday, time_str, capacity in templates:
-        hour, minute = map(int, time_str.split(":"))
-
-        for i in range(days_ahead):
-            day = now.date() + timedelta(days=i)
-            if day.weekday() != weekday:
-                continue
-
-            start_dt = TZ.localize(datetime.combine(day, time(hour, minute)))
-
-            cur.execute(
-                "SELECT id FROM trainings WHERE template_id = ? AND start_time = ?",
-                (tpl_id, start_dt.isoformat())
-            )
-            if cur.fetchone():
-                continue
-
-            cur.execute(
-                "INSERT INTO trainings (template_id, start_time, capacity) VALUES (?, ?, ?)",
-                (tpl_id, start_dt.isoformat(), capacity)
-            )
 
     conn.commit()
     conn.close()
@@ -145,7 +66,8 @@ def generate_trainings(days_ahead=14):
 def main_kb(is_admin=False):
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.add("📅 Ближайшие тренировки")
-    kb.add("📋 Мои записи", "❌ Отменить тренировку")
+    kb.add("📋 Мои записи")
+    kb.add("❌ Отменить тренировку")
     if is_admin:
         kb.add("👀 Просмотр записанных")
     return kb
@@ -156,45 +78,7 @@ def back_kb():
     return kb
 
 # =========================
-# НАПОМИНАНИЕ
-# =========================
-
-async def send_reminder(user_id, training_time, title):
-    await bot.send_message(
-        user_id,
-        f"⏰ Напоминание!\nТренировка «{title}» начнётся в {training_time.strftime('%d.%m %H:%M')}"
-    )
-
-def schedule_reminders():
-    conn = get_db()
-    cur = conn.cursor()
-
-    now = datetime.now(TZ)
-
-    cur.execute("""
-    SELECT users.telegram_id, trainings.start_time, schedule_templates.title
-    FROM bookings
-    JOIN users ON bookings.user_id = users.id
-    JOIN trainings ON bookings.training_id = trainings.id
-    JOIN schedule_templates ON trainings.template_id = schedule_templates.id
-    """)
-
-    for tg_id, start_time, title in cur.fetchall():
-        start_dt = datetime.fromisoformat(start_time)
-        remind_time = start_dt - timedelta(hours=4)
-
-        if remind_time > now:
-            scheduler.add_job(
-                send_reminder,
-                'date',
-                run_date=remind_time,
-                args=[tg_id, start_dt, title]
-            )
-
-    conn.close()
-
-# =========================
-# ХЭНДЛЕРЫ
+# START
 # =========================
 
 @dp.message_handler(commands=["start"])
@@ -202,10 +86,12 @@ async def start(message: types.Message):
     conn = get_db()
     cur = conn.cursor()
 
-    cur.execute(
-        "INSERT OR IGNORE INTO users (telegram_id, name) VALUES (?, ?)",
-        (message.from_user.id, message.from_user.full_name)
-    )
+    cur.execute("""
+        INSERT INTO users (telegram_id, name)
+        VALUES (%s, %s)
+        ON CONFLICT (telegram_id) DO NOTHING
+    """, (message.from_user.id, message.from_user.full_name))
+
     conn.commit()
     conn.close()
 
@@ -214,70 +100,120 @@ async def start(message: types.Message):
         reply_markup=main_kb(message.from_user.id == ADMIN_ID)
     )
 
+# =========================
+# БЛИЖАЙШИЕ ТРЕНИРОВКИ
+# =========================
+
 @dp.message_handler(lambda m: m.text == "📅 Ближайшие тренировки")
 async def show_trainings(message: types.Message):
     conn = get_db()
     cur = conn.cursor()
 
-    now = datetime.now(TZ)
-
     cur.execute("""
-    SELECT trainings.id, schedule_templates.title, trainings.start_time, trainings.capacity
-    FROM trainings
-    JOIN schedule_templates ON trainings.template_id = schedule_templates.id
-    WHERE trainings.start_time > ?
-    ORDER BY trainings.start_time
-    LIMIT 5
-    """, (now.isoformat(),))
+        SELECT id, title, start_time, capacity
+        FROM trainings
+        WHERE start_time > NOW()
+        ORDER BY start_time
+        LIMIT 5
+    """)
 
     rows = cur.fetchall()
     conn.close()
 
     if not rows:
-        await message.answer("Нет ближайших тренировок.")
+        await message.answer("Пока нет ближайших тренировок.")
         return
 
     text = "🏋 Ближайшие тренировки:\n\n"
     for tid, title, start_time, capacity in rows:
-        dt = datetime.fromisoformat(start_time)
-        text += f"{tid}. {title} — {dt.strftime('%d.%m %H:%M')}\n"
+        text += f"{tid}. {title} — {start_time.strftime('%d.%m %H:%M')}\n"
 
-    await message.answer(text + "\nНапишите номер тренировки для записи.", reply_markup=back_kb())
+    text += "\nВведите номер тренировки для записи."
+    await message.answer(text, reply_markup=back_kb())
+
+# =========================
+# ЗАПИСЬ НА ТРЕНИРОВКУ
+# =========================
 
 @dp.message_handler(lambda m: m.text.isdigit())
-async def book_training(message: types.Message):
-    training_id = int(message.text)
-    user_id = message.from_user.id
+async def book_or_cancel(message: types.Message):
+    number = int(message.text)
 
     conn = get_db()
     cur = conn.cursor()
 
-    cur.execute("SELECT id FROM users WHERE telegram_id = ?", (user_id,))
-    user_db_id = cur.fetchone()[0]
+    # пользователь
+    cur.execute(
+        "SELECT id FROM users WHERE telegram_id = %s",
+        (message.from_user.id,)
+    )
+    user = cur.fetchone()
+    if not user:
+        await message.answer("Ошибка пользователя.")
+        conn.close()
+        return
 
-    cur.execute("SELECT start_time, capacity FROM trainings WHERE id = ?", (training_id,))
-    row = cur.fetchone()
-    if not row:
+    user_id = user[0]
+
+    # попытка отмены
+    cur.execute("""
+        DELETE FROM bookings
+        USING users
+        WHERE bookings.id = %s
+        AND bookings.user_id = users.id
+        AND users.telegram_id = %s
+    """, (number, message.from_user.id))
+
+    if cur.rowcount > 0:
+        conn.commit()
+        conn.close()
+        await message.answer("✅ Запись отменена.", reply_markup=main_kb())
+        return
+
+    # попытка записи
+    cur.execute("""
+        SELECT start_time, capacity FROM trainings WHERE id = %s
+    """, (number,))
+    training = cur.fetchone()
+
+    if not training:
         await message.answer("Тренировка не найдена.")
+        conn.close()
         return
 
-    start_dt = datetime.fromisoformat(row[0])
-    capacity = row[1]
+    start_time, capacity = training
 
-    if start_dt <= datetime.now(TZ):
+    if start_time <= datetime.now(TZ):
         await message.answer("⛔ Тренировка уже началась.")
+        conn.close()
         return
 
+    # защита от двойной записи
+    cur.execute("""
+        SELECT 1 FROM bookings
+        WHERE user_id = %s AND training_id = %s
+    """, (user_id, number))
+
+    if cur.fetchone():
+        await message.answer("⚠️ Вы уже записаны на эту тренировку.")
+        conn.close()
+        return
+
+    # проверка лимита
     if capacity is not None:
-        cur.execute("SELECT COUNT(*) FROM bookings WHERE training_id = ?", (training_id,))
+        cur.execute(
+            "SELECT COUNT(*) FROM bookings WHERE training_id = %s",
+            (number,)
+        )
         if cur.fetchone()[0] >= capacity:
-            await message.answer("⛔ На данную дату и время мест не осталось.")
+            await message.answer("⛔ Мест больше нет.")
+            conn.close()
             return
 
-    cur.execute(
-        "INSERT INTO bookings (user_id, training_id, created_at) VALUES (?, ?, ?)",
-        (user_db_id, training_id, datetime.now(TZ).isoformat())
-    )
+    cur.execute("""
+        INSERT INTO bookings (user_id, training_id, created_at)
+        VALUES (%s, %s, %s)
+    """, (user_id, number, datetime.now(TZ)))
 
     conn.commit()
     conn.close()
@@ -285,15 +221,86 @@ async def book_training(message: types.Message):
     await message.answer("✅ Вы успешно записались!", reply_markup=main_kb())
 
 # =========================
+# МОИ ЗАПИСИ
+# =========================
+
+@dp.message_handler(lambda m: m.text == "📋 Мои записи")
+async def my_bookings(message: types.Message):
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT bookings.id, trainings.title, trainings.start_time
+        FROM bookings
+        JOIN trainings ON bookings.training_id = trainings.id
+        JOIN users ON bookings.user_id = users.id
+        WHERE users.telegram_id = %s
+        ORDER BY trainings.start_time
+    """, (message.from_user.id,))
+
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        await message.answer("📭 У вас нет активных записей.")
+        return
+
+    text = "📋 Ваши записи:\n\n"
+    for bid, title, start_time in rows:
+        text += f"{bid}. {title} — {start_time.strftime('%d.%m %H:%M')}\n"
+
+    await message.answer(text)
+
+# =========================
+# КНОПКА ОТМЕНЫ
+# =========================
+
+@dp.message_handler(lambda m: m.text == "❌ Отменить тренировку")
+async def cancel_prompt(message: types.Message):
+    await message.answer(
+        "Введите номер записи для отмены:",
+        reply_markup=back_kb()
+    )
+
+# =========================
+# АДМИН-ПАНЕЛЬ
+# =========================
+
+@dp.message_handler(lambda m: m.text == "👀 Просмотр записанных")
+async def admin_view(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT trainings.title, trainings.start_time, users.name
+        FROM bookings
+        JOIN trainings ON bookings.training_id = trainings.id
+        JOIN users ON bookings.user_id = users.id
+        ORDER BY trainings.start_time
+    """)
+
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        await message.answer("Записей пока нет.")
+        return
+
+    text = "👀 Все записи:\n\n"
+    for title, start_time, name in rows:
+        text += f"{title} — {start_time.strftime('%d.%m %H:%M')} — {name}\n"
+
+    await message.answer(text)
+
+# =========================
 # ЗАПУСК
 # =========================
 
 async def on_startup(dp):
     init_db()
-    seed_templates()
-    generate_trainings()
-    scheduler.start()
-    schedule_reminders()
     print("Bot started")
 
 if __name__ == "__main__":
